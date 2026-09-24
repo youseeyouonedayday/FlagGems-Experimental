@@ -46,8 +46,12 @@ setattr(
 )
 
 # (sparse_dim, nnz, size) triples. Duplicate index columns are present in every
-# case so the value-accumulation branch is always exercised.
-COO_CASES = [(2, 6, (4, 5))]
+# case so the value-accumulation branch is always exercised. The nnz=2000 case
+# crosses the small path's 1024-entry ceiling for every dtype routed through it
+# (fp64/ints/bool): before the scan-path rerouting those dtypes silently
+# dropped every entry past the 1024th (reviewer-reported data-loss bug), so
+# this row is the regression guard for the routing fix.
+COO_CASES = [(2, 6, (4, 5)), (2, 2000, (50, 50))]
 if not QUICK_MODE:
     COO_CASES += [
         (1, 8, (16,)),
@@ -168,6 +172,88 @@ def test_accuracy_coalesce_duplicate_accumulation(size):
     # Whole-tensor check: the dense form must be identical, which catches both
     # a wrong group sum and a wrong sorted position.
     utils.gems_assert_close(res.to_dense(), ref_out.to_dense(), torch.float32)
+
+    # The input is never mutated by the fresh path.
+    assert inp.is_coalesced() is False
+    assert inp._nnz() == 40
+    assert res is not inp
+
+
+@pytest.mark.coalesce
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        [torch.float32, torch.bool]
+        if QUICK_MODE
+        else [torch.float32, torch.float64, torch.int64, torch.bool]
+    ),
+)
+def test_accuracy_coalesce_large_nnz_above_small_path_ceiling(dtype):
+    """nnz > 1024 must produce exactly native's entries for EVERY dtype.
+
+    The small path serves fp64/ints/bool in a single program with
+    BLOCK = 1024 lanes: before the scan-path rerouting, an input with more
+    than 1024 stored entries lost everything past the 1024th (and collapsed
+    positions, so the surviving values were wrong too). The case is built
+    with duplicate coordinates (drawn with replacement) so the merge branch
+    is exercised on both sides, and the full indices/values comparison is
+    asserted, not just the entry count.
+    """
+    inp = _make_coo(2, 2000, (128, 128), dtype, flag_gems.device, seed=21)
+    ref_inp = utils.to_reference(inp)
+
+    ref_out = ref_inp.coalesce()
+    res = flag_gems.coalesce(inp)
+
+    # The ceiling must actually have been crossed: with 2000 draws over
+    # 16384 cells the output cannot collapse to <= 1024 entries.
+    assert ref_out._nnz() > 1024
+    _assert_same_structure(res, ref_out, dtype)
+
+
+@pytest.mark.coalesce
+def test_accuracy_coalesce_large_nnz_duplicate_accumulation_int64():
+    """Large-nnz int64 with known duplicate sums, checked whole-tensor.
+
+    Complements the structural sweep above with an explicit accumulation
+    check on the scan path's int64 branch: the dense form of the coalesced
+    result must equal the dense form native produces, which catches both a
+    dropped entry and a wrong group sum.
+    """
+    inp = _make_coo(2, 2000, (128, 128), torch.int64, flag_gems.device, seed=23)
+    idx = inp._indices()
+    idx[:, 7] = idx[:, 3]
+    vals = inp._values()
+    vals[7] = 3
+    inp = torch.sparse_coo_tensor(idx, vals, (128, 128))
+    ref_inp = utils.to_reference(inp)
+
+    ref_out = ref_inp.coalesce()
+    res = flag_gems.coalesce(inp)
+
+    assert res._nnz() == ref_out._nnz()
+    assert res._nnz() > 1024
+    utils.gems_assert_equal(res._indices(), ref_out._indices())
+    utils.gems_assert_close(res._values(), ref_out._values(), torch.int64)
+    utils.gems_assert_close(res.to_dense(), ref_out.to_dense(), torch.int64)
+
+
+@pytest.mark.coalesce
+def test_accuracy_coalesce_float32_large_nnz_exact():
+    """float32 above the ceiling: multi-program grid must not truncate.
+
+    The float path's grids scale with nnz (``cdiv(n, B)``), so it was never
+    truncated; this case pins that property across the rerouting change so a
+    future single-program regression on the float path cannot pass silently.
+    """
+    inp = _make_coo(2, 5000, (256, 256), torch.float32, flag_gems.device, seed=25)
+    ref_inp = utils.to_reference(inp)
+
+    ref_out = ref_inp.coalesce()
+    res = flag_gems.coalesce(inp)
+
+    assert ref_out._nnz() > 1024
+    _assert_same_structure(res, ref_out, torch.float32)
 
 
 @pytest.mark.coalesce
