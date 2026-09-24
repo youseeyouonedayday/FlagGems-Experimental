@@ -432,7 +432,13 @@ def _cfg_f32(M, N, K):
     return 16, 16, 32, 2, 2, 8
 
 
+# Shape-class -> block-config memo. Every distinct (M, N, K, dtype) the process
+# ever sees would add an entry for the life of the module, so the dict is
+# bounded: FIFO eviction beyond _CFG_CACHE_MAX keeps memory flat while
+# retaining every config a steady working set re-requests. The entries are tiny
+# 7-tuples and the key is a 4-tuple, so the bound is a few hundred KiB at most.
 _CFG_CACHE = {}
+_CFG_CACHE_MAX = 4096
 
 
 def _pick_config(M, N, K, dt):
@@ -449,6 +455,9 @@ def _pick_config(M, N, K, dt):
     else:
         bm, bn, bk, w, s, gm = _cfg_f32(M, N, K)
         hit = (bm, bn, bk, w, s, gm, 64)
+    if len(_CFG_CACHE) >= _CFG_CACHE_MAX:
+        # Insertion-ordered dict: pop the oldest key (FIFO).
+        _CFG_CACHE.pop(next(iter(_CFG_CACHE)))
     _CFG_CACHE[key] = hit
     return hit
 
@@ -590,6 +599,13 @@ def _chain_matmul_impl(matrices):
     plan = _plan(dims)
     if n == 3 and max(dims) <= 16:
         return _chain3(matrices[0], matrices[1], matrices[2], plan[0] == (0, 1))
+    # Fused path: fires only for the one 4-matrix parenthesization the DP
+    # produces as ``A @ (B @ (C @ D))`` -- plan == [(2, 3), (1, 4), (0, 5)].
+    # The plan predicate is what selects that DP shape; every other 4-matrix
+    # plan (e.g. ``(A @ B) @ (C @ D)`` or a different split) falls through to
+    # the general loop below and is computed by the plain ``_mm`` path. The
+    # dtype/dimension guards that follow then decide whether the fused kernel
+    # can hold the shapes, and otherwise fall through as well.
     if (
         n == 4
         and len(plan) == 3
@@ -600,6 +616,15 @@ def _chain_matmul_impl(matrices):
         and matrices[0].dtype in (torch.float16, torch.bfloat16)
     ):
         a, b, c, d = matrices
+        # These bounds are not independent of ``_mm_last2_kernel``'s hardcoded
+        # BLOCK constants (BLOCK_MF=128, BLOCK_NE=64, BLOCK_MO=64): the fused
+        # kernel keeps the whole F = B @ E product and the A panel in
+        # registers, so it is only correct for shapes that those block sizes
+        # tile exactly. b.shape[0] <= 128 <-> BLOCK_MF, d.shape[1] <= 64 <->
+        # BLOCK_NE, a.shape[0] <= 64 <-> BLOCK_MO. Changing the block sizes
+        # means re-tuning these guards together (and re-running the sweep);
+        # changing these guards without the kernel would be a silent
+        # correctness bug.
         if (
             b.shape[0] <= 128
             and d.shape[1] <= 64
@@ -622,11 +647,10 @@ def chain_matmul(matrices) -> torch.Tensor:
     """
     logger.debug("GEMS CHAIN_MATMUL")
     matrices = list(matrices)
+    # _check_matrices already rejects the empty list ("Expected one or more
+    # matrices") after its per-element dim loop, so no second check is needed
+    # here.
     _check_matrices(matrices)
-    if len(matrices) == 0:
-        # Unreachable for a valid call, kept as the documented short-circuit:
-        # an empty chain has no output tensor to allocate.
-        raise RuntimeError("chain_matmul(): Expected one or more matrices")
     return _chain_matmul_impl(matrices)
 
 
