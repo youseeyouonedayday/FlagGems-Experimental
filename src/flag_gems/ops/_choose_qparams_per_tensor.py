@@ -221,7 +221,19 @@ def _capture_fused(x, pmn, pmx, counter, out, flag, n, n_progs, BLOCK, nw):
     # Capture is only entered from the plain-launch branch, and only after the
     # caller has been cleared of holding a capture (see the caller).
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # ``capture_error_mode="thread_local"``: torch.cuda.graph's default
+    # "global" mode makes the capture forbid potentially-unsafe calls
+    # *process-wide* -- a ``.item()``/stream sync issued by another thread
+    # (here: the non-contiguous path's ``out2[0].item()``) errors with
+    # "operation not permitted when stream is capturing" and poisons every
+    # concurrent caller with a sticky CUDA error. Measured (H20, mixed
+    # contiguous + non-contiguous threads): with the default mode a single
+    # capture window kills four concurrent workers; with "thread_local" the
+    # capture only constrains the capturing thread, which is the scope the
+    # module lock already serializes. Scratch-buffer safety is unaffected:
+    # the lock below still serializes every contiguous call, and the
+    # non-contiguous path keeps its own per-call buffers.
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
         _launch_fused(x, pmn, pmx, counter, out, flag, n, n_progs, BLOCK, nw)
     return g
 
