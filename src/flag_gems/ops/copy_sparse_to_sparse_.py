@@ -39,9 +39,13 @@ def _copy_fused(si, di, ni, sv, dv, nv, split, BLOCK: tl.constexpr):
         tl.store(dv + offs, tl.load(sv + offs, mask=mask), mask=mask)
 
 
-# Unmasked variant: used only when both streams are exactly BLOCK-divisible
-# (true for every benchmark workload). Consistently ~0.5-0.7us faster on the
-# fp32 indices-heavy large workloads in interleaved A/B screening.
+# Unmasked variant: reachable only on the big-block path (BLOCK == _BLOCK_BIG
+# = 2048, i.e. only when ni + nv >= _BIG_THRESH) AND both streams exactly
+# BLOCK-divisible — the guard below also demands ni % BLOCK == 0 and
+# nv % BLOCK == 0, so on the small-block path (_BLOCK_SMALL = 1024) this
+# kernel never runs even when the streams are divisible. True for every
+# benchmark workload. Consistently ~0.5-0.7us faster on the fp32
+# indices-heavy large workloads in interleaved A/B screening.
 @triton.jit
 def _copy_fused_nomask(si, di, ni, sv, dv, nv, split, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
@@ -68,38 +72,44 @@ def _fused_copy(src_idx, dst_idx, src_val, dst_val, device):
 
     Kept from the supplied source verbatim: the BLOCK/num_warps choices, the
     size threshold, the masked/nomask kernel selection and the split arithmetic
-    are unchanged.
+    are unchanged. The source guarded all of that behind ``if ni + nv > 0:``;
+    the same skip is expressed here as an explicit early return for the
+    both-streams-empty case.
     """
     ni = src_idx.numel()
     nv = src_val.numel()
-    if ni + nv > 0:
-        BLOCK = _BLOCK_BIG if ni + nv >= _BIG_THRESH else _BLOCK_SMALL
-        split = (ni + BLOCK - 1) // BLOCK
-        grid = (split + (nv + BLOCK - 1) // BLOCK,)
-        if BLOCK == _BLOCK_BIG and ni % BLOCK == 0 and nv % BLOCK == 0:
-            _copy_fused_nomask[grid](
-                src_idx,
-                dst_idx,
-                ni,
-                src_val,
-                dst_val,
-                nv,
-                split,
-                BLOCK=BLOCK,
-                num_warps=_NW,
-            )
-        else:
-            _copy_fused[grid](
-                src_idx,
-                dst_idx,
-                ni,
-                src_val,
-                dst_val,
-                nv,
-                split,
-                BLOCK=BLOCK,
-                num_warps=_NW,
-            )
+    if ni + nv == 0:
+        # Both streams empty: there is nothing to copy and no grid to launch;
+        # an explicit return keeps the BLOCK/threshold selection below tied to
+        # at least one non-empty stream.
+        return
+    BLOCK = _BLOCK_BIG if ni + nv >= _BIG_THRESH else _BLOCK_SMALL
+    split = (ni + BLOCK - 1) // BLOCK
+    grid = (split + (nv + BLOCK - 1) // BLOCK,)
+    if BLOCK == _BLOCK_BIG and ni % BLOCK == 0 and nv % BLOCK == 0:
+        _copy_fused_nomask[grid](
+            src_idx,
+            dst_idx,
+            ni,
+            src_val,
+            dst_val,
+            nv,
+            split,
+            BLOCK=BLOCK,
+            num_warps=_NW,
+        )
+    else:
+        _copy_fused[grid](
+            src_idx,
+            dst_idx,
+            ni,
+            src_val,
+            dst_val,
+            nv,
+            split,
+            BLOCK=BLOCK,
+            num_warps=_NW,
+        )
 
 
 def _grow_error(kind, before, after):
@@ -143,10 +153,22 @@ def _contiguous_buffers(t, name):
     """
     idx, val = t._indices(), t._values()
     if not idx.is_contiguous():
-        logger.debug("GEMS COPY_SPARSE_TO_SPARSE_ %s: materialising indices", name)
+        logger.debug(
+            "GEMS COPY_SPARSE_TO_SPARSE_ %s: materialising indices "
+            "(shape=%s, nnz=%d)",
+            name,
+            tuple(t.shape),
+            t._nnz(),
+        )
         idx = idx.contiguous()
     if not val.is_contiguous():
-        logger.debug("GEMS COPY_SPARSE_TO_SPARSE_ %s: materialising values", name)
+        logger.debug(
+            "GEMS COPY_SPARSE_TO_SPARSE_ %s: materialising values "
+            "(shape=%s, nnz=%d)",
+            name,
+            tuple(t.shape),
+            t._nnz(),
+        )
         val = val.contiguous()
     return idx, val
 
